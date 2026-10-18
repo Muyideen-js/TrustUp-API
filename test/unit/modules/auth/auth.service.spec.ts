@@ -51,7 +51,10 @@ describe('AuthService', () => {
   const mockSessionsRepository = {
     findByHash: jest.fn(),
     create: jest.fn(),
-    update: jest.fn(),
+    markRotated: jest.fn(),
+    findById: jest.fn(),
+    findActiveByUserId: jest.fn(),
+    revokeAllByUserId: jest.fn(),
     delete: jest.fn(),
     deleteByHash: jest.fn(),
     revokeFamily: jest.fn(),
@@ -474,6 +477,7 @@ describe('AuthService', () => {
       mockJwtService.verifyAsync = jest.fn().mockResolvedValue(mockPayload);
       mockSessionsRepository.findByHash.mockResolvedValue(mockSession);
       mockUsersRepository.findByWallet.mockResolvedValue(mockUser);
+      mockSessionsRepository.markRotated.mockResolvedValue(true);
     });
 
     it('should refresh tokens successfully', async () => {
@@ -482,13 +486,45 @@ describe('AuthService', () => {
       expect(result).toHaveProperty('accessToken');
       expect(result).toHaveProperty('refreshToken');
       expect(result.expiresIn).toBe(900);
-      expect(mockSessionsRepository.update).toHaveBeenCalledWith(
-        mockSession.id,
+      expect(mockSessionsRepository.markRotated).toHaveBeenCalledWith(mockSession.id);
+      expect(mockSessionsRepository.create).toHaveBeenCalledWith(
         expect.objectContaining({
+          userId: mockSession.user_id,
           refreshTokenHash: expect.any(String),
           expiresAt: expect.any(String),
+          tokenFamily: mockSession.token_family,
         }),
       );
+    });
+
+    it('should store device info and IP on the rotated session', async () => {
+      await service.refreshTokens(validRefreshToken, { deviceInfo: 'UA', ipAddress: '1.2.3.4' });
+
+      expect(mockSessionsRepository.create).toHaveBeenCalledWith(
+        expect.objectContaining({ deviceInfo: 'UA', ipAddress: '1.2.3.4' }),
+      );
+    });
+
+    it('should revoke the family if the session was already rotated concurrently', async () => {
+      mockSessionsRepository.markRotated.mockResolvedValue(false);
+
+      await expect(service.refreshTokens(validRefreshToken)).rejects.toThrow(UnauthorizedException);
+      expect(mockSessionsRepository.revokeFamily).toHaveBeenCalledWith(mockSession.token_family);
+      expect(mockSessionsRepository.create).not.toHaveBeenCalled();
+    });
+
+    it('should detect replay of an already-rotated token and revoke the family', async () => {
+      // First use rotates; the old row is now marked revoked_at and replay finds it.
+      await service.refreshTokens(validRefreshToken);
+      mockSessionsRepository.findByHash.mockResolvedValue({
+        ...mockSession,
+        revoked_at: new Date().toISOString(),
+      });
+
+      await expect(service.refreshTokens(validRefreshToken)).rejects.toMatchObject({
+        response: { code: 'AUTH_TOKEN_REVOKED' },
+      });
+      expect(mockSessionsRepository.revokeFamily).toHaveBeenCalledWith(mockSession.token_family);
     });
 
     it('should throw UnauthorizedException on invalid token signature', async () => {
@@ -547,6 +583,56 @@ describe('AuthService', () => {
       });
 
       await expect(service.refreshTokens(validRefreshToken)).rejects.toThrow(UnauthorizedException);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // session management
+  // ---------------------------------------------------------------------------
+  describe('session management', () => {
+    const mockUser = { id: 'user-uuid', wallet_address: validWallet, status: 'active' };
+    const row = {
+      id: 'session-uuid',
+      user_id: 'user-uuid',
+      device_info: 'UA',
+      ip_address: '1.2.3.4',
+      created_at: 'c',
+      expires_at: 'e',
+      token_family: 'family-uuid',
+      revoked_at: null,
+    };
+
+    beforeEach(() => {
+      mockUsersRepository.findByWallet.mockResolvedValue(mockUser);
+    });
+
+    it('lists active sessions', async () => {
+      mockSessionsRepository.findActiveByUserId.mockResolvedValue([row]);
+
+      await expect(service.listSessions(validWallet)).resolves.toEqual([
+        { id: 'session-uuid', deviceInfo: 'UA', ipAddress: '1.2.3.4', createdAt: 'c', expiresAt: 'e' },
+      ]);
+    });
+
+    it('revokes the family of an owned session', async () => {
+      mockSessionsRepository.findById.mockResolvedValue(row);
+
+      await service.revokeSession(validWallet, 'session-uuid');
+      expect(mockSessionsRepository.revokeFamily).toHaveBeenCalledWith('family-uuid');
+    });
+
+    it('rejects revoking a session owned by someone else', async () => {
+      mockSessionsRepository.findById.mockResolvedValue({ ...row, user_id: 'other' });
+
+      await expect(service.revokeSession(validWallet, 'session-uuid')).rejects.toMatchObject({
+        response: { code: 'AUTH_SESSION_NOT_FOUND' },
+      });
+      expect(mockSessionsRepository.revokeFamily).not.toHaveBeenCalled();
+    });
+
+    it('revokes all sessions of the user', async () => {
+      await service.revokeAllSessions(validWallet);
+      expect(mockSessionsRepository.revokeAllByUserId).toHaveBeenCalledWith('user-uuid');
     });
   });
 

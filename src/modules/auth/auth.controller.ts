@@ -6,12 +6,24 @@ import {
   HttpCode,
   HttpStatus,
   Req,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  UseGuards,
   BadRequestException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiConsumes, ApiBody } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiConsumes,
+  ApiBody,
+  ApiBearerAuth,
+  ApiParam,
+} from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { FastifyRequest } from 'fastify';
-import { AuthService } from './auth.service';
+import { AuthService, SessionMeta } from './auth.service';
 import { NonceRequestDto } from './dto/nonce-request.dto';
 import { NonceResponseDto } from './dto/nonce-response.dto';
 import { VerifyRequestDto } from './dto/verify-request.dto';
@@ -20,6 +32,17 @@ import { RegisterRequestDto } from './dto/register-request.dto';
 import { RefreshTokenDto, RefreshTokenSchema } from './dto/refresh-token.dto';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { ALLOWED_MIME_TYPES } from '../../config/env';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
+
+/** Extracts device (User-Agent) and IP address from the request for session tracking. */
+function sessionMetaFromRequest(req?: FastifyRequest): SessionMeta {
+  const ua = req?.headers?.['user-agent'];
+  return {
+    deviceInfo: typeof ua === 'string' ? ua.slice(0, 255) : undefined,
+    ipAddress: req?.ip,
+  };
+}
 
 @ApiTags('auth')
 @Controller('auth')
@@ -69,7 +92,7 @@ export class AuthController {
       }
     }
 
-    return this.authService.register(dto, profileFile);
+    return this.authService.register(dto, profileFile, sessionMetaFromRequest(req));
   }
 
   @Post('nonce')
@@ -113,9 +136,12 @@ export class AuthController {
     status: 401,
     description: 'Nonce not found, expired, already used, invalid signature, or blocked account',
   })
-  async verify(@Body() dto: VerifyRequestDto): Promise<AuthResponseDto> {
+  async verify(
+    @Body() dto: VerifyRequestDto,
+    @Req() req?: FastifyRequest,
+  ): Promise<AuthResponseDto> {
     await this.authService.verifySignature(dto);
-    return this.authService.generateTokens(dto.wallet);
+    return this.authService.generateTokens(dto.wallet, sessionMetaFromRequest(req));
   }
 
   @Post('refresh')
@@ -124,7 +150,7 @@ export class AuthController {
   @ApiOperation({
     summary: 'Refresh JWT access token using a refresh token',
     description:
-      'Validates the refresh token. If valid, deletes the old session and generates a new access token (15 min) and a new refresh token (7 days). Aligns with refresh token rotation.',
+      'Validates the refresh token. If valid, marks the old session as used and issues a new access token (15 min) and a new refresh token (7 days) in the same token family. Replaying an already-used refresh token revokes the whole family.',
   })
   @ApiResponse({
     status: 200,
@@ -135,8 +161,9 @@ export class AuthController {
   @ApiResponse({ status: 401, description: 'Invalid, expired, or revoked refresh token' })
   async refresh(
     @Body(new ZodValidationPipe(RefreshTokenSchema)) dto: RefreshTokenDto,
+    @Req() req?: FastifyRequest,
   ): Promise<AuthResponseDto> {
-    return this.authService.refreshTokens(dto.refreshToken);
+    return this.authService.refreshTokens(dto.refreshToken, sessionMetaFromRequest(req));
   }
 
   @Delete('logout')
@@ -157,5 +184,66 @@ export class AuthController {
     @Body(new ZodValidationPipe(RefreshTokenSchema)) dto: RefreshTokenDto,
   ): Promise<void> {
     await this.authService.logout(dto.refreshToken);
+  }
+
+  @Get('sessions')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'List active sessions (devices) for the current user',
+    description:
+      'Returns all non-revoked, non-expired sessions with device info and IP address, newest first.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Active sessions',
+    schema: {
+      example: [
+        {
+          id: '3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f',
+          deviceInfo: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+          ipAddress: '203.0.113.7',
+          createdAt: '2026-02-13T10:00:00.000Z',
+          expiresAt: '2026-02-20T10:00:00.000Z',
+        },
+      ],
+    },
+  })
+  @ApiResponse({ status: 401, description: 'Missing or invalid access token' })
+  async listSessions(@CurrentUser() user: { wallet: string }) {
+    return this.authService.listSessions(user.wallet);
+  }
+
+  @Delete('sessions/:id')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Revoke a specific session (device)',
+    description: 'Revokes the given session and its whole refresh-token family.',
+  })
+  @ApiParam({ name: 'id', description: 'Session UUID' })
+  @ApiResponse({ status: 204, description: 'Session revoked' })
+  @ApiResponse({ status: 401, description: 'Missing or invalid access token' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  async revokeSession(
+    @CurrentUser() user: { wallet: string },
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ): Promise<void> {
+    await this.authService.revokeSession(user.wallet, id);
+  }
+
+  @Delete('sessions')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Log out from all devices',
+    description: 'Revokes every active session of the current user.',
+  })
+  @ApiResponse({ status: 204, description: 'All sessions revoked' })
+  @ApiResponse({ status: 401, description: 'Missing or invalid access token' })
+  async revokeAllSessions(@CurrentUser() user: { wallet: string }): Promise<void> {
+    await this.authService.revokeAllSessions(user.wallet);
   }
 }
