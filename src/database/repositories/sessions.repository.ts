@@ -120,27 +120,71 @@ export class SessionsRepository extends BaseRepository {
   }
 
   /**
-   * Updates an existing session by ID (used for atomic token rotation).
+   * Marks a session as used/rotated by setting `revoked_at`. The row is kept so a
+   * later replay of its refresh token can be detected.
+   * Only succeeds if the session was not already revoked; returns false otherwise
+   * (i.e. a concurrent rotation already consumed it).
    */
-  async update(
-    id: string,
-    updateData: {
-      refreshTokenHash: string;
-      expiresAt: string;
-    },
-  ): Promise<SessionRecord> {
+  async markRotated(id: string): Promise<boolean> {
     const { data, error } = await this.supabaseService
       .getServiceRoleClient()
       .from('sessions')
-      .update({
-        refresh_token_hash: updateData.refreshTokenHash,
-        expires_at: updateData.expiresAt,
-      })
+      .update({ revoked_at: new Date().toISOString() })
       .eq('id', id)
-      .select('*')
-      .single();
+      .is('revoked_at', null)
+      .select('id');
+
+    this.throwOnError(error);
+    return Array.isArray(data) && data.length > 0;
+  }
+
+  /**
+   * Finds a session by ID.
+   */
+  async findById(id: string): Promise<SessionRecord | null> {
+    const { data, error } = await this.supabaseService
+      .getServiceRoleClient()
+      .from('sessions')
+      .select(
+        'id, user_id, refresh_token_hash, device_info, ip_address, expires_at, created_at, token_family, revoked_at',
+      )
+      .eq('id', id)
+      .maybeSingle();
 
     this.throwOnError(error);
     return data;
+  }
+
+  /**
+   * Lists active (not revoked, not expired) sessions for a user, newest first.
+   */
+  async findActiveByUserId(userId: string): Promise<SessionRecord[]> {
+    const { data, error } = await this.supabaseService
+      .getServiceRoleClient()
+      .from('sessions')
+      .select(
+        'id, user_id, refresh_token_hash, device_info, ip_address, expires_at, created_at, token_family, revoked_at',
+      )
+      .eq('user_id', userId)
+      .is('revoked_at', null)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false });
+
+    this.throwOnError(error);
+    return data ?? [];
+  }
+
+  /**
+   * Revokes every non-revoked session of a user (logout from all devices).
+   */
+  async revokeAllByUserId(userId: string): Promise<void> {
+    const { error } = await this.supabaseService
+      .getServiceRoleClient()
+      .from('sessions')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('user_id', userId)
+      .is('revoked_at', null);
+
+    this.throwOnError(error);
   }
 }
